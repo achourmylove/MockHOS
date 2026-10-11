@@ -1,0 +1,6 @@
+{
+  "summary":  "Implementation plan for adding Bluetooth State & Connectivity BroadcastReceiver and a system floating overlay bubble over other apps / app drawer to maximize the app, along with persistent notification quick actions.",
+  "updatedAt":  "2026-10-11T18:13:51.902325493Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}

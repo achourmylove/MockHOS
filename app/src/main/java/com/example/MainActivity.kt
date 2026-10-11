@@ -1,8 +1,6 @@
 package com.example
 
 import android.Manifest
-import android.annotation.SuppressLint
-import android.bluetooth.BluetoothDevice
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -35,6 +33,8 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Autorenew
+import androidx.compose.material.icons.filled.BatteryChargingFull
 import androidx.compose.material.icons.filled.Bluetooth
 import androidx.compose.material.icons.filled.BluetoothConnected
 import androidx.compose.material.icons.filled.CheckCircle
@@ -44,11 +44,15 @@ import androidx.compose.material.icons.filled.GpsFixed
 import androidx.compose.material.icons.filled.GpsOff
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.LocationOn
+import androidx.compose.material.icons.filled.OpenInNew
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.PowerSettingsNew
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.SwapHoriz
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -60,7 +64,6 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
@@ -76,6 +79,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -87,6 +91,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -94,6 +99,7 @@ import androidx.core.content.ContextCompat
 import com.example.ui.theme.EmeraldSuccess
 import com.example.ui.theme.MyApplicationTheme
 import com.example.ui.theme.RoseError
+import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -116,29 +122,24 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun MainScreen() {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val serviceState by ServiceEventBus.state.collectAsState()
 
+    var currentRole by remember { mutableStateOf(AppPreferences.getRole(context)) }
     var selectedTab by remember { mutableIntStateOf(0) }
-    var targetMac by remember { mutableStateOf("00:11:22:33:44:55") }
-    var sendIntervalSec by remember { mutableIntStateOf(10) }
-    var includeTelemetry by remember { mutableStateOf(true) }
-    var pairedDevices by remember { mutableStateOf<List<BluetoothDevice>>(emptyList()) }
-
-    val bluetoothOutput = remember { BluetoothOutput(context) }
-
-    // Load paired devices
-    fun refreshPairedDevices() {
-        pairedDevices = bluetoothOutput.getBondedDevices()
-        if (pairedDevices.isNotEmpty() && (targetMac == "00:11:22:33:44:55" || targetMac.isEmpty())) {
-            targetMac = pairedDevices.first().address
-        }
+    var sendIntervalSec by remember { mutableIntStateOf(AppPreferences.getIntervalSec(context)) }
+    var includeTelemetry by remember { mutableStateOf(AppPreferences.isTelemetryEnabled(context)) }
+    var autoStartBoot by remember { mutableStateOf(AppPreferences.isAutoStartEnabled(context)) }
+    var batterySaverEnabled by remember { mutableStateOf(AppPreferences.isBatterySaverEnabled(context)) }
+    var floatingOverlayEnabled by remember { mutableStateOf(AppPreferences.isFloatingOverlayEnabled(context)) }
+    var hasOverlayPermission by remember {
+        mutableStateOf(
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) android.provider.Settings.canDrawOverlays(context) else true
+        )
     }
+    var backupStatus by remember { mutableStateOf<String?>("Backing up app to Downloads...") }
 
-    LaunchedEffect(Unit) {
-        refreshPairedDevices()
-    }
-
-    // Permission launcher
+    // Permissions list
     val permissionsToRequest = remember {
         mutableListOf(
             Manifest.permission.ACCESS_FINE_LOCATION,
@@ -166,12 +167,44 @@ fun MainScreen() {
         contract = ActivityResultContracts.RequestMultiplePermissions()
     ) { results ->
         hasRequiredPermissions = results.values.all { it }
-        if (hasRequiredPermissions) {
-            refreshPairedDevices()
-            Toast.makeText(context, "All permissions granted!", Toast.LENGTH_SHORT).show()
-        } else {
-            Toast.makeText(context, "Location & Bluetooth permissions required for broadcast", Toast.LENGTH_LONG).show()
+        if (hasRequiredPermissions && currentRole != AppRole.NOT_SET && !serviceState.isRunning) {
+            // Auto run service once permissions are granted
+            startConfiguredService(context, currentRole)
         }
+    }
+
+    // Auto backup on startup + Auto run service if role configured
+    LaunchedEffect(currentRole, hasRequiredPermissions) {
+        // Auto backup once
+        scope.launch {
+            val res = AppBackupManager.performAutoBackup(context)
+            if (res.isSuccess) {
+                backupStatus = "Saved to ${res.getOrNull()}"
+            } else {
+                backupStatus = "Backup: ${res.exceptionOrNull()?.message}"
+            }
+        }
+
+        // Auto start service without waiting for user interaction if role is decided
+        if (currentRole != AppRole.NOT_SET && hasRequiredPermissions && !serviceState.isRunning) {
+            startConfiguredService(context, currentRole)
+        }
+    }
+
+    // First time setup screen if role is NOT_SET
+    if (currentRole == AppRole.NOT_SET) {
+        FirstTimeSetupScreen(
+            onRoleSelected = { chosenRole ->
+                AppPreferences.setRole(context, chosenRole)
+                currentRole = chosenRole
+                if (!hasRequiredPermissions) {
+                    permissionLauncher.launch(permissionsToRequest)
+                } else {
+                    startConfiguredService(context, chosenRole)
+                }
+            }
+        )
+        return
     }
 
     Scaffold(
@@ -189,12 +222,16 @@ fun MainScreen() {
                         Spacer(modifier = Modifier.width(8.dp))
                         Column {
                             Text(
-                                text = "HeadUnit GPS Streamer",
+                                text = if (currentRole == AppRole.SENDER) "GPS Transmitter (Sender)" else "Head-Unit (Receiver)",
                                 style = MaterialTheme.typography.titleMedium,
                                 fontWeight = FontWeight.Bold
                             )
                             Text(
-                                text = if (serviceState.isRunning) "Broadcasting active" else "Service stopped",
+                                text = if (serviceState.isRunning) {
+                                    if (serviceState.isBtConnected) "Connected & Exchanging" else "Service Active (Auto-Connecting)"
+                                } else {
+                                    "Service Idle"
+                                },
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -203,12 +240,25 @@ fun MainScreen() {
                 },
                 actions = {
                     IconButton(
-                        onClick = { refreshPairedDevices() },
-                        modifier = Modifier.testTag("refresh_devices_btn")
+                        onClick = {
+                            scope.launch {
+                                val res = AppBackupManager.performAutoBackup(context)
+                                if (res.isSuccess) {
+                                    val p = res.getOrNull()
+                                    backupStatus = "Saved to $p"
+                                    Toast.makeText(context, "App backup saved to $p", Toast.LENGTH_SHORT).show()
+                                } else {
+                                    val err = res.exceptionOrNull()?.message ?: "Error"
+                                    backupStatus = "Backup failed: $err"
+                                    Toast.makeText(context, "Backup failed: $err", Toast.LENGTH_SHORT).show()
+                                }
+                            }
+                        },
+                        modifier = Modifier.testTag("manual_backup_btn")
                     ) {
                         Icon(
-                            imageVector = Icons.Default.Refresh,
-                            contentDescription = "Refresh paired devices"
+                            imageVector = Icons.Default.Save,
+                            contentDescription = "Backup app APK to Downloads"
                         )
                     }
                 },
@@ -223,7 +273,37 @@ fun MainScreen() {
                 .fillMaxSize()
                 .padding(paddingValues)
         ) {
-            // Permission Banner if missing
+            // Auto backup banner
+            if (backupStatus != null) {
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Save,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "Auto-Backup: $backupStatus",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+            }
+
+            // Missing permissions alert
             if (!hasRequiredPermissions) {
                 Card(
                     modifier = Modifier
@@ -239,23 +319,22 @@ fun MainScreen() {
                     ) {
                         Icon(
                             imageVector = Icons.Default.Error,
-                            contentDescription = "Permission warning",
+                            contentDescription = null,
                             tint = MaterialTheme.colorScheme.error
                         )
                         Spacer(modifier = Modifier.width(12.dp))
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = "Permissions Needed",
+                                text = "Permissions Required",
                                 fontWeight = FontWeight.Bold,
                                 color = MaterialTheme.colorScheme.onErrorContainer
                             )
                             Text(
-                                text = "GPS & Bluetooth permissions are required to broadcast coordinates to your car.",
+                                text = "Grant location & Bluetooth to let background auto-exchange run.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onErrorContainer
                             )
                         }
-                        Spacer(modifier = Modifier.width(8.dp))
                         Button(
                             onClick = { permissionLauncher.launch(permissionsToRequest) },
                             modifier = Modifier.testTag("grant_permissions_btn")
@@ -266,7 +345,6 @@ fun MainScreen() {
                 }
             }
 
-            // Tabs
             TabRow(
                 selectedTabIndex = selectedTab,
                 containerColor = MaterialTheme.colorScheme.surface
@@ -274,19 +352,19 @@ fun MainScreen() {
                 Tab(
                     selected = selectedTab == 0,
                     onClick = { selectedTab = 0 },
-                    text = { Text("Streamer Control") },
+                    text = { Text(if (currentRole == AppRole.SENDER) "Transmitter" else "Receiver") },
                     icon = { Icon(Icons.Default.DirectionsCar, contentDescription = null) }
                 )
                 Tab(
                     selected = selectedTab == 1,
                     onClick = { selectedTab = 1 },
-                    text = { Text("Live Telemetry") },
+                    text = { Text("Coordinates") },
                     icon = { Icon(Icons.Default.LocationOn, contentDescription = null) }
                 )
                 Tab(
                     selected = selectedTab == 2,
                     onClick = { selectedTab = 2 },
-                    text = { Text("Head-Unit Setup") },
+                    text = { Text("Settings") },
                     icon = { Icon(Icons.Default.Settings, contentDescription = null) }
                 )
             }
@@ -297,46 +375,202 @@ fun MainScreen() {
                     .padding(horizontal = 16.dp)
             ) {
                 when (selectedTab) {
-                    0 -> ControlTab(
+                    0 -> AutoDashboardTab(
+                        currentRole = currentRole,
                         serviceState = serviceState,
-                        hasPermissions = hasRequiredPermissions,
-                        targetMac = targetMac,
-                        onTargetMacChange = { targetMac = it },
-                        sendIntervalSec = sendIntervalSec,
-                        onSendIntervalChange = { sendIntervalSec = it },
-                        includeTelemetry = includeTelemetry,
-                        onIncludeTelemetryChange = { includeTelemetry = it },
-                        pairedDevices = pairedDevices,
-                        onRequestPermissions = { permissionLauncher.launch(permissionsToRequest) },
-                        onStartService = {
-                            startLocationService(context, targetMac, sendIntervalSec, includeTelemetry)
-                        },
-                        onStopService = {
-                            stopLocationService(context)
-                        }
+                        onRestartService = { startConfiguredService(context, currentRole) },
+                        onStopService = { stopConfiguredService(context) }
                     )
                     1 -> TelemetryTab(serviceState = serviceState)
-                    2 -> HeadUnitReceiverGuideTab(targetMac = targetMac)
+                    2 -> SettingsTab(
+                        currentRole = currentRole,
+                        onRoleChange = { newRole ->
+                            AppPreferences.setRole(context, newRole)
+                            currentRole = newRole
+                            // Restart service with new role automatically
+                            stopConfiguredService(context)
+                            startConfiguredService(context, newRole)
+                        },
+                        autoStartBoot = autoStartBoot,
+                        onAutoStartBootChange = {
+                            autoStartBoot = it
+                            AppPreferences.setAutoStartEnabled(context, it)
+                        },
+                        sendIntervalSec = sendIntervalSec,
+                        onSendIntervalChange = {
+                            sendIntervalSec = it
+                            AppPreferences.setIntervalSec(context, it)
+                        },
+                        includeTelemetry = includeTelemetry,
+                        onIncludeTelemetryChange = {
+                            includeTelemetry = it
+                            AppPreferences.setTelemetryEnabled(context, it)
+                        },
+                        batterySaverEnabled = batterySaverEnabled,
+                        onBatterySaverEnabledChange = {
+                            batterySaverEnabled = it
+                            AppPreferences.setBatterySaverEnabled(context, it)
+                        },
+                        onRequestBatteryOptimizationExemption = {
+                            try {
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                                    val intent = Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                                    context.startActivity(intent)
+                                }
+                            } catch (e: Exception) {
+                                Toast.makeText(context, "Could not open battery settings directly", Toast.LENGTH_SHORT).show()
+                            }
+                        },
+                        floatingOverlayEnabled = floatingOverlayEnabled,
+                        onFloatingOverlayEnabledChange = { enabled ->
+                            floatingOverlayEnabled = enabled
+                            AppPreferences.setFloatingOverlayEnabled(context, enabled)
+                            if (enabled) {
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !android.provider.Settings.canDrawOverlays(context)) {
+                                    Toast.makeText(context, "Please grant 'Display over other apps' permission", Toast.LENGTH_LONG).show()
+                                    val intent = Intent(
+                                        android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                        android.net.Uri.parse("package:${context.packageName}")
+                                    )
+                                    context.startActivity(intent)
+                                } else {
+                                    val overlayIntent = Intent(context, FloatingOverlayService::class.java).apply {
+                                        action = FloatingOverlayService.ACTION_START
+                                    }
+                                    context.startService(overlayIntent)
+                                }
+                            } else {
+                                val overlayIntent = Intent(context, FloatingOverlayService::class.java).apply {
+                                    action = FloatingOverlayService.ACTION_STOP
+                                }
+                                context.startService(overlayIntent)
+                            }
+                        },
+                        hasOverlayPermission = hasOverlayPermission,
+                        onRequestOverlayPermission = {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                                val intent = Intent(
+                                    android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                    android.net.Uri.parse("package:${context.packageName}")
+                                )
+                                context.startActivity(intent)
+                            }
+                        }
+                    )
                 }
             }
         }
     }
 }
 
-@SuppressLint("MissingPermission")
+/**
+ * First-Time Setup Wizard: Sender or Receiver
+ */
 @Composable
-fun ControlTab(
+fun FirstTimeSetupScreen(onRoleSelected: (AppRole) -> Unit) {
+    Scaffold(modifier = Modifier.fillMaxSize()) { padding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .padding(24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Icon(
+                imageVector = Icons.Default.DirectionsCar,
+                contentDescription = null,
+                modifier = Modifier.size(64.dp),
+                tint = MaterialTheme.colorScheme.primary
+            )
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Text(
+                text = "HeadUnit GPS Setup",
+                style = MaterialTheme.typography.headlineMedium,
+                fontWeight = FontWeight.Bold,
+                textAlign = TextAlign.Center
+            )
+
+            Text(
+                text = "Select what this device will do. Both devices connect and exchange GPS automatically without MAC or verification prompts.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.padding(vertical = 12.dp)
+            )
+
+            Spacer(modifier = Modifier.height(24.dp))
+
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { onRoleSelected(AppRole.SENDER) }
+                    .testTag("select_sender_card"),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
+            ) {
+                Column(modifier = Modifier.padding(20.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.GpsFixed, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Text(
+                            text = "GPS Sender (Source Phone)",
+                            fontWeight = FontWeight.Bold,
+                            style = MaterialTheme.typography.titleMedium
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "Runs on your handheld phone with GPS. Periodically acquires live coordinates and streams JSON to the car automatically.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { onRoleSelected(AppRole.RECEIVER) }
+                    .testTag("select_receiver_card"),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+            ) {
+                Column(modifier = Modifier.padding(20.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.BluetoothConnected, contentDescription = null, tint = MaterialTheme.colorScheme.secondary)
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Text(
+                            text = "GPS Receiver (Car Head-Unit)",
+                            fontWeight = FontWeight.Bold,
+                            style = MaterialTheme.typography.titleMedium
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "Runs on the car's Android head-unit. Listens on Bluetooth SPP and accepts incoming GPS streams automatically.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(24.dp))
+
+            Text(
+                text = "You can change this role anytime in Settings.",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+}
+
+@Composable
+fun AutoDashboardTab(
+    currentRole: AppRole,
     serviceState: ServiceEventBus.ServiceState,
-    hasPermissions: Boolean,
-    targetMac: String,
-    onTargetMacChange: (String) -> Unit,
-    sendIntervalSec: Int,
-    onSendIntervalChange: (Int) -> Unit,
-    includeTelemetry: Boolean,
-    onIncludeTelemetryChange: (Boolean) -> Unit,
-    pairedDevices: List<BluetoothDevice>,
-    onRequestPermissions: () -> Unit,
-    onStartService: () -> Unit,
+    onRestartService: () -> Unit,
     onStopService: () -> Unit
 ) {
     LazyColumn(
@@ -346,7 +580,6 @@ fun ControlTab(
         verticalArrangement = Arrangement.spacedBy(16.dp),
         contentPadding = PaddingValues(vertical = 16.dp)
     ) {
-        // Main Status Card
         item {
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -358,7 +591,7 @@ fun ControlTab(
                     }
                 )
             ) {
-                Column(modifier = Modifier.padding(16.dp)) {
+                Column(modifier = Modifier.padding(20.dp)) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
@@ -366,16 +599,16 @@ fun ControlTab(
                     ) {
                         Column {
                             Text(
-                                text = if (serviceState.isRunning) "SERVICE RUNNING" else "SERVICE STOPPED",
-                                style = MaterialTheme.typography.labelMedium,
+                                text = if (currentRole == AppRole.SENDER) "ROLE: SENDER (GPS SOURCE)" else "ROLE: RECEIVER (HEAD-UNIT)",
+                                style = MaterialTheme.typography.labelSmall,
                                 fontWeight = FontWeight.Bold,
-                                color = if (serviceState.isRunning) MaterialTheme.colorScheme.primary else Color.Gray
+                                color = MaterialTheme.colorScheme.primary
                             )
                             Spacer(modifier = Modifier.height(4.dp))
                             Text(
-                                text = serviceState.statusMessage,
-                                style = MaterialTheme.typography.bodyMedium,
-                                fontWeight = FontWeight.Medium
+                                text = if (serviceState.isRunning) "Running Automatically" else "Service Stopped",
+                                style = MaterialTheme.typography.titleLarge,
+                                fontWeight = FontWeight.Bold
                             )
                         }
 
@@ -383,7 +616,7 @@ fun ControlTab(
                             imageVector = if (serviceState.isBtConnected) {
                                 Icons.Default.BluetoothConnected
                             } else if (serviceState.isRunning) {
-                                Icons.Default.GpsFixed
+                                Icons.Default.Autorenew
                             } else {
                                 Icons.Default.GpsOff
                             },
@@ -393,43 +626,57 @@ fun ControlTab(
                         )
                     }
 
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    Text(
+                        text = serviceState.statusMessage,
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+
+                    if (serviceState.isRunning) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Surface(
+                                color = if (serviceState.isBatterySaverActive) MaterialTheme.colorScheme.tertiary.copy(alpha = 0.2f) else MaterialTheme.colorScheme.primary.copy(alpha = 0.15f),
+                                shape = RoundedCornerShape(6.dp)
+                            ) {
+                                Text(
+                                    text = if (serviceState.isBatterySaverActive) "⚡ Battery Saver Active (${serviceState.activeIntervalSec}s interval)" else "⚡ Active Interval: ${serviceState.activeIntervalSec}s",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = if (serviceState.isBatterySaverActive) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                )
+                            }
+                        }
+                    }
+
                     Spacer(modifier = Modifier.height(16.dp))
 
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(12.dp)
-                    ) {
-                        if (!serviceState.isRunning) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        if (serviceState.isRunning) {
                             Button(
-                                onClick = {
-                                    if (!hasPermissions) {
-                                        onRequestPermissions()
-                                    } else {
-                                        onStartService()
-                                    }
-                                },
+                                onClick = onStopService,
+                                colors = ButtonDefaults.buttonColors(containerColor = RoseError),
                                 modifier = Modifier
                                     .weight(1f)
-                                    .height(48.dp)
-                                    .testTag("start_service_btn"),
-                                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
+                                    .testTag("stop_service_btn")
                             ) {
-                                Icon(Icons.Default.PlayArrow, contentDescription = null)
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text("Start Broadcasting")
+                                Icon(Icons.Default.Stop, contentDescription = null)
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Pause Service")
                             }
                         } else {
                             Button(
-                                onClick = onStopService,
+                                onClick = onRestartService,
+                                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
                                 modifier = Modifier
                                     .weight(1f)
-                                    .height(48.dp)
-                                    .testTag("stop_service_btn"),
-                                colors = ButtonDefaults.buttonColors(containerColor = RoseError)
+                                    .testTag("resume_service_btn")
                             ) {
-                                Icon(Icons.Default.Stop, contentDescription = null)
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text("Stop Service")
+                                Icon(Icons.Default.PlayArrow, contentDescription = null)
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Resume Service")
                             }
                         }
                     }
@@ -437,7 +684,6 @@ fun ControlTab(
             }
         }
 
-        // Bluetooth Target Setup
         item {
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -445,90 +691,51 @@ fun ControlTab(
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Default.Bluetooth, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                        Icon(Icons.Default.CheckCircle, contentDescription = null, tint = EmeraldSuccess)
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = "Car Head-Unit Bluetooth Target",
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.Bold
+                            text = "Zero-Verification Auto Exchange",
+                            fontWeight = FontWeight.Bold,
+                            style = MaterialTheme.typography.titleSmall
                         )
                     }
-
-                    Spacer(modifier = Modifier.height(12.dp))
-
+                    Spacer(modifier = Modifier.height(8.dp))
                     Text(
-                        text = "Paired Devices in Phone:",
+                        text = "• No MAC addresses or prompts required.\n• Once phone and car are paired, they connect automatically.\n• The foreground service resumes immediately after phone boot / restart.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-
-                    Spacer(modifier = Modifier.height(6.dp))
-
-                    if (pairedDevices.isEmpty()) {
-                        Text(
-                            text = "No paired Bluetooth devices detected. Pair your phone with your car's head-unit in Android Settings → Bluetooth first.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.error
-                        )
-                    } else {
-                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                            pairedDevices.forEach { dev ->
-                                val devName = try { dev.name ?: "Unknown Device" } catch (e: Exception) { "Unknown" }
-                                val devMac = dev.address
-                                val isSelected = targetMac.equals(devMac, ignoreCase = true)
-
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .clip(RoundedCornerShape(8.dp))
-                                        .background(if (isSelected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant)
-                                        .clickable { onTargetMacChange(devMac) }
-                                        .padding(horizontal = 12.dp, vertical = 8.dp),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Column {
-                                        Text(
-                                            text = devName,
-                                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
-                                            style = MaterialTheme.typography.bodyMedium
-                                        )
-                                        Text(
-                                            text = devMac,
-                                            style = MaterialTheme.typography.labelSmall,
-                                            fontFamily = FontFamily.Monospace,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                                        )
-                                    }
-                                    if (isSelected) {
-                                        Icon(
-                                            Icons.Default.CheckCircle,
-                                            contentDescription = "Selected",
-                                            tint = MaterialTheme.colorScheme.primary
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    Spacer(modifier = Modifier.height(12.dp))
-
-                    OutlinedTextField(
-                        value = targetMac,
-                        onValueChange = onTargetMacChange,
-                        label = { Text("Head-Unit MAC Address") },
-                        placeholder = { Text("00:11:22:33:44:55") },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .testTag("target_mac_input"),
-                        singleLine = true
                     )
                 }
             }
         }
+    }
+}
 
-        // Transmission Settings
+@Composable
+fun SettingsTab(
+    currentRole: AppRole,
+    onRoleChange: (AppRole) -> Unit,
+    autoStartBoot: Boolean,
+    onAutoStartBootChange: (Boolean) -> Unit,
+    sendIntervalSec: Int,
+    onSendIntervalChange: (Int) -> Unit,
+    includeTelemetry: Boolean,
+    onIncludeTelemetryChange: (Boolean) -> Unit,
+    batterySaverEnabled: Boolean,
+    onBatterySaverEnabledChange: (Boolean) -> Unit,
+    onRequestBatteryOptimizationExemption: () -> Unit,
+    floatingOverlayEnabled: Boolean,
+    onFloatingOverlayEnabledChange: (Boolean) -> Unit,
+    hasOverlayPermission: Boolean,
+    onRequestOverlayPermission: () -> Unit
+) {
+    LazyColumn(
+        modifier = Modifier
+            .fillMaxSize()
+            .navigationBarsPadding(),
+        verticalArrangement = Arrangement.spacedBy(16.dp),
+        contentPadding = PaddingValues(vertical = 16.dp)
+    ) {
         item {
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -536,18 +743,93 @@ fun ControlTab(
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Text(
-                        text = "Transmission Configuration",
+                        text = "App Role (Current: ${currentRole.name})",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold
                     )
-
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "Switch between broadcasting GPS coordinates or receiving them on the car head-unit:",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
                     Spacer(modifier = Modifier.height(12.dp))
 
-                    Text(
-                        text = "Update Interval: ${sendIntervalSec} seconds",
-                        style = MaterialTheme.typography.bodyMedium
-                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        OutlinedButton(
+                            onClick = { onRoleChange(AppRole.SENDER) },
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("role_sender_btn"),
+                            colors = if (currentRole == AppRole.SENDER) {
+                                ButtonDefaults.outlinedButtonColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
+                            } else {
+                                ButtonDefaults.outlinedButtonColors()
+                            }
+                        ) {
+                            Text("Sender (Phone)")
+                        }
 
+                        OutlinedButton(
+                            onClick = { onRoleChange(AppRole.RECEIVER) },
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("role_receiver_btn"),
+                            colors = if (currentRole == AppRole.RECEIVER) {
+                                ButtonDefaults.outlinedButtonColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)
+                            } else {
+                                ButtonDefaults.outlinedButtonColors()
+                            }
+                        ) {
+                            Text("Receiver (Car)")
+                        }
+                    }
+                }
+            }
+        }
+
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text(
+                        text = "Auto-Start & Boot Settings",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Auto-Start on Phone Reboot", fontWeight = FontWeight.SemiBold)
+                            Text(
+                                "Resumes GPS foreground streaming automatically after device restart (ACTION_BOOT_COMPLETED).",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(
+                            checked = autoStartBoot,
+                            onCheckedChange = onAutoStartBootChange,
+                            modifier = Modifier.testTag("boot_switch")
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+                    HorizontalDivider()
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    Text("Broadcast Interval: ${sendIntervalSec}s", fontWeight = FontWeight.SemiBold)
+                    Spacer(modifier = Modifier.height(6.dp))
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -572,12 +854,9 @@ fun ControlTab(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
+                            Text("Include Extra Telemetry", fontWeight = FontWeight.SemiBold)
                             Text(
-                                text = "Extended Telemetry",
-                                fontWeight = FontWeight.SemiBold
-                            )
-                            Text(
-                                text = "Include altitude, speed (km/h), and timestamp in JSON",
+                                "Attach altitude, speed, and accuracy to JSON stream.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -589,31 +868,75 @@ fun ControlTab(
                         )
                     }
 
-                    Spacer(modifier = Modifier.height(8.dp))
+                    Spacer(modifier = Modifier.height(12.dp))
+                    HorizontalDivider()
+                    Spacer(modifier = Modifier.height(12.dp))
 
-                    val previewJson = if (includeTelemetry) {
-                        "{\"lat\": 37.421998, \"lon\": -122.084000, \"alt\": 30.5, \"speed\": 45.0, \"time\": 1712839200000}"
-                    } else {
-                        "{\"lat\": 37.421998, \"lon\": -122.084000}"
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Battery Saver Mode", fontWeight = FontWeight.SemiBold)
+                            Text(
+                                "Automatically increases GPS polling interval (to 30s+) during low-power states (Power Save Mode or battery ≤ 20%) to prevent draining the phone.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(
+                            checked = batterySaverEnabled,
+                            onCheckedChange = onBatterySaverEnabledChange,
+                            modifier = Modifier.testTag("battery_saver_switch")
+                        )
                     }
 
-                    Text(
-                        text = "JSON Payload Format Preview:",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Surface(
-                        color = MaterialTheme.colorScheme.surfaceVariant,
-                        shape = RoundedCornerShape(8.dp),
-                        modifier = Modifier.fillMaxWidth()
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    OutlinedButton(
+                        onClick = onRequestBatteryOptimizationExemption,
+                        modifier = Modifier.fillMaxWidth().testTag("battery_opt_btn")
                     ) {
-                        Text(
-                            text = previewJson,
-                            fontFamily = FontFamily.Monospace,
-                            fontSize = 11.sp,
-                            modifier = Modifier.padding(10.dp)
+                        Icon(Icons.Default.BatteryChargingFull, contentDescription = null)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Configure Battery Optimization Exemption")
+                    }
+
+                    Spacer(modifier = Modifier.height(16.dp))
+                    HorizontalDivider()
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Floating Button over App Drawer", fontWeight = FontWeight.SemiBold)
+                            Text(
+                                "Displays a draggable floating button on screen to quickly maximize the app at any time.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(
+                            checked = floatingOverlayEnabled,
+                            onCheckedChange = onFloatingOverlayEnabledChange,
+                            modifier = Modifier.testTag("floating_overlay_switch")
                         )
+                    }
+
+                    if (!hasOverlayPermission) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        OutlinedButton(
+                            onClick = onRequestOverlayPermission,
+                            modifier = Modifier.fillMaxWidth().testTag("grant_overlay_btn")
+                        ) {
+                            Icon(Icons.Default.OpenInNew, contentDescription = null)
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("Grant 'Display over other apps' Permission")
+                        }
                     }
                 }
             }
@@ -640,7 +963,7 @@ fun TelemetryTab(serviceState: ServiceEventBus.ServiceState) {
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Text(
-                        text = "Current GPS Coordinates",
+                        text = "Real-Time GPS Telemetry",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold
                     )
@@ -704,7 +1027,7 @@ fun TelemetryTab(serviceState: ServiceEventBus.ServiceState) {
                     if (serviceState.lastPayload != null) {
                         Spacer(modifier = Modifier.height(12.dp))
                         Text(
-                            text = "Last Transmitted JSON Payload:",
+                            text = "Last Transmitted / Received JSON:",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -752,7 +1075,7 @@ fun TelemetryTab(serviceState: ServiceEventBus.ServiceState) {
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = "Transmission History (${serviceState.logs.size})",
+                    text = "Exchange Log (${serviceState.logs.size})",
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold
                 )
@@ -788,11 +1111,11 @@ fun TelemetryTab(serviceState: ServiceEventBus.ServiceState) {
                         )
                         Spacer(modifier = Modifier.height(8.dp))
                         Text(
-                            text = "No broadcasts recorded yet",
+                            text = "No transmissions logged yet",
                             fontWeight = FontWeight.Medium
                         )
                         Text(
-                            text = "Start the foreground service from the Streamer Control tab to begin sending periodic GPS coordinates.",
+                            text = "Coordinates exchange starts automatically once devices are in Bluetooth range.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -859,169 +1182,10 @@ fun TelemetryTab(serviceState: ServiceEventBus.ServiceState) {
     }
 }
 
-@Composable
-fun HeadUnitReceiverGuideTab(targetMac: String) {
-    val clipboardManager = LocalClipboardManager.current
-    val context = LocalContext.current
-
-    val receiverKotlinCode = """
-// Companion Android Receiver Skeleton for Car Head-Unit
-package com.example.headunitreceiver
-
-import android.app.Service
-import android.bluetooth.BluetoothAdapter
-import android.bluetooth.BluetoothServerSocket
-import android.bluetooth.BluetoothSocket
-import android.content.Intent
-import android.os.IBinder
-import java.io.BufferedReader
-import java.io.InputStreamReader
-import java.util.UUID
-import kotlin.concurrent.thread
-
-class BluetoothListeningService : Service() {
-    private val SPP_UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
-    private var serverSocket: BluetoothServerSocket? = null
-    @Volatile private var isRunning = true
-
-    override fun onCreate() {
-        super.onCreate()
-        try {
-            serverSocket = BluetoothAdapter.getDefaultAdapter()
-                ?.listenUsingRfcommWithServiceRecord("HeadunitLocation", SPP_UUID)
-            startListening()
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-    }
-
-    private fun startListening() {
-        thread {
-            while (isRunning) {
-                try {
-                    val socket: BluetoothSocket? = serverSocket?.accept()
-                    socket?.use { s ->
-                        val reader = BufferedReader(InputStreamReader(s.inputStream))
-                        var line: String?
-                        while (isRunning && reader.readLine().also { line = it } != null) {
-                            line?.let { payload ->
-                                // Received JSON: {"lat": 37.42..., "lon": -122.08...}
-                                // Dispatch to Head-Unit Map / Navigation SDK!
-                                println("Received GPS: " + payload)
-                            }
-                        }
-                    }
-                } catch (e: Exception) {
-                    if (!isRunning) break
-                }
-            }
-        }
-    }
-
-    override fun onDestroy() {
-        isRunning = false
-        serverSocket?.close()
-        super.onDestroy()
-    }
-
-    override fun onBind(intent: Intent?): IBinder? = null
-}
-    """.trimIndent()
-
-    LazyColumn(
-        modifier = Modifier
-            .fillMaxSize()
-            .navigationBarsPadding(),
-        verticalArrangement = Arrangement.spacedBy(16.dp),
-        contentPadding = PaddingValues(vertical = 16.dp)
-    ) {
-        item {
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
-            ) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Text(
-                        text = "Head-Unit Receiver Protocol",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        text = "This app streams standard NMEA/WGS84 GPS latitude and longitude as UTF-8 encoded JSON strings across a standard Bluetooth Serial Port Profile (SPP / RFCOMM) socket.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-
-                    Spacer(modifier = Modifier.height(12.dp))
-
-                    Text(text = "Key Specifications:", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodySmall)
-                    Text(text = "• UUID: 00001101-0000-1000-8000-00805F9B34FB (Standard SPP)", style = MaterialTheme.typography.bodySmall)
-                    Text(text = "• Transport: Bluetooth RFCOMM stream", style = MaterialTheme.typography.bodySmall)
-                    Text(text = "• Delimiter: Newline ('\\n') after each JSON payload", style = MaterialTheme.typography.bodySmall)
-                    Text(text = "• Format: {\"lat\": <double>, \"lon\": <double>}", style = MaterialTheme.typography.bodySmall)
-                }
-            }
-        }
-
-        item {
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
-            ) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = "Head-Unit Receiver Code (Kotlin)",
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.Bold
-                        )
-                        OutlinedButton(
-                            onClick = {
-                                clipboardManager.setText(AnnotatedString(receiverKotlinCode))
-                                Toast.makeText(context, "Copied Receiver code to clipboard", Toast.LENGTH_SHORT).show()
-                            },
-                            modifier = Modifier.testTag("copy_receiver_code_btn")
-                        ) {
-                            Text("Copy Code")
-                        }
-                    }
-
-                    Spacer(modifier = Modifier.height(8.dp))
-
-                    Surface(
-                        color = MaterialTheme.colorScheme.surfaceVariant,
-                        shape = RoundedCornerShape(8.dp),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text(
-                            text = receiverKotlinCode,
-                            fontFamily = FontFamily.Monospace,
-                            fontSize = 11.sp,
-                            modifier = Modifier.padding(12.dp)
-                        )
-                    }
-                }
-            }
-        }
-    }
-}
-
-private fun startLocationService(
-    context: Context,
-    targetMac: String,
-    intervalSec: Int,
-    includeTelemetry: Boolean
-) {
+private fun startConfiguredService(context: Context, role: AppRole) {
     val intent = Intent(context, LocationBroadcastService::class.java).apply {
         action = LocationBroadcastService.ACTION_START
-        putExtra(LocationBroadcastService.EXTRA_MAC_ADDRESS, targetMac)
-        putExtra(LocationBroadcastService.EXTRA_INTERVAL_SEC, intervalSec)
-        putExtra(LocationBroadcastService.EXTRA_INCLUDE_TELEMETRY, includeTelemetry)
+        putExtra(LocationBroadcastService.EXTRA_ROLE, role.name)
     }
 
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -1031,7 +1195,7 @@ private fun startLocationService(
     }
 }
 
-private fun stopLocationService(context: Context) {
+private fun stopConfiguredService(context: Context) {
     val intent = Intent(context, LocationBroadcastService::class.java).apply {
         action = LocationBroadcastService.ACTION_STOP
     }

@@ -1,5 +1,6 @@
 package com.example
 
+import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.content.BroadcastReceiver
@@ -14,6 +15,7 @@ class BluetoothStateReceiver : BroadcastReceiver() {
         private const val TAG = "BluetoothStateReceiver"
     }
 
+    @SuppressLint("MissingPermission")
     override fun onReceive(context: Context, intent: Intent) {
         val action = intent.action ?: return
         Log.d(TAG, "Received Bluetooth broadcast: $action")
